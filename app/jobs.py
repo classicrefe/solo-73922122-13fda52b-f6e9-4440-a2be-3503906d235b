@@ -86,3 +86,5 @@ def _remove_tree(path: Path) -> None:
 
 
 registry = JobRegistry()
+# 迁移取数核查使用独立的任务注册表，与缩减任务互不影响
+migration_registry = JobRegistry()

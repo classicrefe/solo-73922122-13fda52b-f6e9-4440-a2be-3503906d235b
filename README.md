@@ -5,6 +5,24 @@
 表结构与剩余行值不变、外键始终有效的前提下删除数据行，直到得到 **1-最小**
 复现库——删除任意一行（连同直接或间接引用它的全部行）后都无法再复现同一错误。
 
+另有**迁移取数核查**入口：调整故障样本库结构前，先确认下游取数 SQL 不丢行、
+不改值。上传符合原有约束的 SQLite 库、不得访问外部文件的迁移 SQL 和 1～3 条
+确定性只读 SELECT，服务在独立副本上执行迁移并逐条比对两侧查询结果，
+全部一致才提供升级库下载。
+
+## 迁移取数核查（严格）
+
+* 迁移脚本在**独立副本**上执行，必须完整成功（错误、超时都算失败）；
+* 关闭连接后，按**实际已提交**的数据校验目标库的结构与外键
+  （与上传库同一套约束）及完整性；
+* 每条取数查询在原库与目标库上**各执行两遍**，两遍一致才认可其确定性；
+* 逐条比对两侧结果：**列名序列、每个值的 SQLite 类型与内容、重复行次数**，
+  忽略行顺序；
+* 查询结果超过 **200 行**或超过现有试跑时限一律不放行；
+* 迁移或查询错误、两侧差异都会在页面展示（差异时展示两侧完整结果）；
+* 任何失败都不提供升级库，也不改变原件与已有缩减结果；
+  全部一致才可下载 `upgraded.db`。
+
 ## 复现判定（严格）
 
 * 以 SQLite **扩展错误码 + 完整错误文本** 作为错误指纹，两者完全一致才算复现；
@@ -74,7 +92,7 @@ docker compose down -v       # 同时删除任务数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest             # 48 个测试
+.venv/bin/pytest             # 100 个测试
 ```
 
 ## 内置样例
@@ -93,7 +111,8 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 | `MAX_DB_BYTES` | 20971520 | 上传库大小上限（字节） |
 | `MAX_SCRIPT_BYTES` | 262144 | 脚本大小上限（字节） |
 | `MAX_TRIALS` | 800 | 单次任务试跑次数上限 |
-| `TRIAL_TIMEOUT_SECONDS` | 15 | 单次试跑超时 |
+| `TRIAL_TIMEOUT_SECONDS` | 15 | 单次试跑超时（迁移执行与取数查询共用此时限） |
+| `MAX_QUERY_ROWS` | 200 | 迁移核查中单条取数查询的行数上限 |
 | `JOB_TTL_SECONDS` | 3600 | 任务结果保留时长 |
 | `MAX_CONCURRENT_JOBS` | 2 | 后台并发任务数 |
 | `DATA_DIR` | `/data` | 任务工作目录（容器内挂载为数据卷） |
@@ -102,11 +121,14 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 单页前端 |
+| GET | `/` | 单页前端（缩减 + 迁移取数核查两个入口） |
 | GET | `/api/samples` | 内置样例清单与下载地址 |
 | POST | `/api/jobs` | 表单字段 `db`（必填）、`sql`（文件）或 `script_text`（文本），返回 202 与任务 id |
 | GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志 |
 | GET | `/api/jobs/{id}/download` | 下载复现库 `repro.db`（仅缩减成功时可用） |
+| POST | `/api/migration-jobs` | 迁移取数核查：`db`（必填）、`migration`（文件）或 `migration_text`（文本）、`query1`～`query3`（至少 1 条只读 SELECT） |
+| GET | `/api/migration-jobs/{id}` | 核查状态、迁移/查询错误、每条查询的比对结果与两侧数据 |
+| GET | `/api/migration-jobs/{id}/download` | 下载升级库 `upgraded.db`（仅全部查询一致时可用） |
 
 ## 目录结构
 
@@ -116,14 +138,15 @@ app/
   errors.py        # 业务异常
   validation.py    # 库结构/行/外键图校验
   script_guard.py  # 脚本静态检查
-  runner.py        # 规范副本、authorizer、独立副本试跑、确定性双跑
+  runner.py        # 规范副本、authorizer、独立副本试跑、迁移执行、确定性双跑
   reducer.py       # ddmin + 逐行闭包终检
-  jobs.py          # 后台任务与并发/TTL 管理
-  service.py       # 上传->校验->确认->缩减 流水线
+  migration.py     # 取数查询解析、只读执行（200 行/时限）、两侧结果比对
+  jobs.py          # 后台任务与并发/TTL 管理（缩减与迁移核查各自独立注册表）
+  service.py       # 上传->校验->确认->缩减 / 迁移->校验->比对 两条流水线
   samples.py       # 内置样例生成
   main.py          # FastAPI 路由
   static/index.html
-tests/             # 48 个单元/集成/端到端测试
+tests/             # 100 个单元/集成/端到端测试
 Dockerfile
 docker-compose.yml
 ```

@@ -34,6 +34,13 @@ _BANNED_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def check_text_safety(text: str) -> None:
+    """对已解码的 SQL 文本做静态安全检查（迁移脚本与取数查询共用）。"""
+    for pattern, message in _BANNED_PATTERNS:
+        if pattern.search(text):
+            raise ScriptRejected(message)
+
+
 def parse_script(raw: bytes) -> str:
     if len(raw) == 0:
         raise ScriptRejected("SQL 脚本为空。")
@@ -49,7 +56,5 @@ def parse_script(raw: bytes) -> str:
         raise ScriptRejected(f"脚本必须是 UTF-8 文本：{exc}") from exc
     if not text.strip():
         raise ScriptRejected("SQL 脚本为空。")
-    for pattern, message in _BANNED_PATTERNS:
-        if pattern.search(text):
-            raise ScriptRejected(message)
+    check_text_safety(text)
     return text

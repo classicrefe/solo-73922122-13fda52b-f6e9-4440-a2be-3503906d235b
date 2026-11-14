@@ -46,13 +46,23 @@
   a.dl { display: inline-block; margin-top: 12px; background: var(--green);
          color: #fff; text-decoration: none; padding: 9px 22px; border-radius: 6px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .tag { font-size: 10px; color: var(--muted); border: 1px solid var(--border);
+         border-radius: 4px; padding: 0 4px; margin-left: 4px; white-space: nowrap; }
+  .sides { display: flex; gap: 12px; flex-wrap: wrap; }
+  .sides > div { flex: 1 1 320px; min-width: 0; overflow-x: auto; }
+  .sides h4 { margin: 8px 0 4px; font-size: 13px; }
+  .qblock { border: 1px solid var(--border); border-radius: 6px;
+            padding: 10px 12px; margin-top: 12px; }
+  .qblock pre { margin: 6px 0; max-height: 120px; }
+  textarea.q { min-height: 60px; }
 </style>
 </head>
 <body>
 <header>
   <h1>SQLite 复现库缩减服务</h1>
   <p>上传结构受限的 SQLite 库与确定性 SQL 脚本，确认原始错误后自动删除数据行，
-     生成“再删任一行及其外键闭包就无法复现”的最小复现库。</p>
+     生成“再删任一行及其外键闭包就无法复现”的最小复现库。
+     另有“迁移取数核查”：调整库结构前，验证下游取数 SQL 不丢行、不改值。</p>
 </header>
 <main>
   <section class="card constraints">
@@ -91,6 +101,39 @@
         <span id="job-status" class="pill"></span></h2>
     <p id="job-message"></p>
     <div id="job-detail"></div>
+  </section>
+
+  <section class="card">
+    <h2>迁移取数核查</h2>
+    <p class="hint">调整故障样本库结构前，确认下游取数 SQL 不丢行、不改值：
+      上传符合原有约束的 SQLite 库、不得访问外部文件的迁移 SQL，以及 1～3 条
+      确定性只读 SELECT。服务在独立副本上执行迁移（脚本须完整成功），关闭连接后
+      按实际已提交的数据校验目标库结构与外键，再逐条比对两侧查询结果的
+      <b>列名、每个值的 SQLite 类型与内容、重复行次数</b>（忽略行顺序）。
+      查询超过 200 行或试跑时限不予放行；全部一致才可下载升级库。</p>
+    <form id="mig-form">
+      <label for="mig-db">SQLite 数据库文件（.db）</label>
+      <input id="mig-db" name="db" type="file" accept=".db,.sqlite,.sqlite3,application/x-sqlite3" required>
+      <label for="mig-sql">迁移 SQL 文件（可选，与下方文本框二选一）</label>
+      <input id="mig-sql" name="migration" type="file" accept=".sql,text/plain">
+      <label for="mig-sql-text">或直接粘贴迁移 SQL</label>
+      <textarea id="mig-sql-text" name="migration_text"
+        placeholder="ALTER TABLE employee ADD COLUMN note TEXT;"></textarea>
+      <label for="mig-q1">取数查询 1（必填，单条只读 SELECT）</label>
+      <textarea id="mig-q1" class="q" name="query1" placeholder="SELECT id, name FROM dept;"></textarea>
+      <label for="mig-q2">取数查询 2（可选）</label>
+      <textarea id="mig-q2" class="q" name="query2"></textarea>
+      <label for="mig-q3">取数查询 3（可选）</label>
+      <textarea id="mig-q3" class="q" name="query3"></textarea>
+      <div><button id="mig-submit-btn" type="submit">上传并开始核查</button></div>
+    </form>
+  </section>
+
+  <section class="card status" id="mig-panel">
+    <h2>迁移核查 <span id="mig-job-id" class="pill"></span>
+        <span id="mig-job-status" class="pill"></span></h2>
+    <p id="mig-job-message"></p>
+    <div id="mig-job-detail"></div>
   </section>
 </main>
 
@@ -239,6 +282,154 @@ function finish(id, job) {
     html += `<a class="dl" href="/api/jobs/${id}/download">下载复现库 repro.db</a>`;
   }
   $('job-detail').innerHTML = html;
+}
+
+/* ---------------- 迁移取数核查 ---------------- */
+let migPollTimer = null;
+
+$('mig-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const form = new FormData();
+  const db = $('mig-db').files[0];
+  const migFile = $('mig-sql').files[0];
+  const migText = $('mig-sql-text').value;
+  if (!db) { alert('请选择数据库文件'); return; }
+  if (!migFile && !migText.trim()) { alert('请上传或粘贴迁移 SQL'); return; }
+  const queries = [$('mig-q1').value, $('mig-q2').value, $('mig-q3').value]
+    .filter((q) => q.trim());
+  if (!queries.length) { alert('请至少填写 1 条取数查询（只读 SELECT）'); return; }
+  form.append('db', db);
+  if (migFile) form.append('migration', migFile);
+  form.append('migration_text', migText);
+  form.append('query1', $('mig-q1').value);
+  form.append('query2', $('mig-q2').value);
+  form.append('query3', $('mig-q3').value);
+  submitMigration(form);
+});
+
+async function submitMigration(form) {
+  $('mig-submit-btn').disabled = true;
+  $('mig-panel').classList.add('active');
+  setMigStatus('running', '已上传，等待处理…');
+  $('mig-job-detail').innerHTML = '';
+  try {
+    const r = await fetch('/api/migration-jobs', { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    $('mig-job-id').textContent = data.id.slice(0, 8);
+    pollMigration(data.id);
+  } catch (err) {
+    setMigStatus('error', '');
+    $('mig-job-message').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+    $('mig-submit-btn').disabled = false;
+  }
+}
+
+function setMigStatus(status, message) {
+  const el = $('mig-job-status');
+  el.className = `pill ${status}`;
+  el.textContent = { queued: '排队中', running: '运行中', done: '完成',
+                     error: '失败' }[status] || status;
+  if (message) $('mig-job-message').textContent = message;
+}
+
+function pollMigration(id) {
+  clearInterval(migPollTimer);
+  migPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/migration-jobs/${id}`);
+      const job = await r.json();
+      if (!r.ok) throw new Error(job.detail || `HTTP ${r.status}`);
+      setMigStatus(job.status, job.message);
+      if (job.status === 'done') { finishMigration(id, job); clearInterval(migPollTimer); }
+      if (job.status === 'error') {
+        $('mig-job-message').innerHTML = `<span class="err">${esc(job.message)}</span>`;
+        clearInterval(migPollTimer);
+        $('mig-submit-btn').disabled = false;
+      }
+    } catch (err) {
+      clearInterval(migPollTimer);
+      setMigStatus('error', '');
+      $('mig-job-message').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+      $('mig-submit-btn').disabled = false;
+    }
+  }, 1000);
+}
+
+const MIG_KIND_LABEL = {
+  verified: ['done', '全部一致'],
+  mismatch: ['error', '结果不一致'],
+  migration_failed: ['error', '迁移失败'],
+  migration_invalid_schema: ['error', '目标库不合规'],
+  query_failed: ['error', '查询执行失败'],
+  query_rejected: ['error', '查询超限不予放行'],
+  nondeterministic: ['error', '查询非确定'],
+};
+const QUERY_STATUS_LABEL = {
+  ok: ['done', '一致'],
+  mismatch: ['error', '不一致'],
+  error: ['error', '执行失败'],
+  rejected: ['error', '不予放行'],
+  nondeterministic: ['error', '非确定'],
+};
+
+function migErrorBlock(title, e) {
+  if (!e) return '';
+  return `<p><b>${title}</b>：<code>${esc(e.error_name || '')}` +
+    `${e.error_code != null ? ` (${e.error_code})` : ''}</code><br>` +
+    `<span class="err">${esc(e.error_message || '')}</span></p>`;
+}
+
+function cellHtml(cell) {
+  const v = cell.v === null || cell.v === undefined ? '<i>NULL</i>' : esc(String(cell.v));
+  return `<td>${v}<span class="tag">${esc(cell.t)}</span></td>`;
+}
+
+function sideTable(title, columns, rows, count) {
+  let h = `<div><h4>${title}（${count} 行）</h4><table><tr>`;
+  h += columns.map((c) => `<th>${esc(c)}</th>`).join('') + '</tr>';
+  for (const row of rows) h += '<tr>' + row.map(cellHtml).join('') + '</tr>';
+  return h + '</table></div>';
+}
+
+function renderQuery(idx, q) {
+  const [pill, label] = QUERY_STATUS_LABEL[q.status] || ['', q.status];
+  let h = `<div class="qblock"><b>查询 ${idx}</b>
+           <span class="pill ${pill}">${label}</span>`;
+  h += `<pre>${esc(q.sql)}</pre>`;
+  if (q.detail) h += `<p>${esc(q.detail)}</p>`;
+  if (q.error) h += migErrorBlock('SQLite 错误', q.error);
+  if (q.differences && q.differences.length) {
+    h += '<details open><summary>差异明细</summary><ul>' +
+      q.differences.map((d) => `<li><code>${esc(d)}</code></li>`).join('') +
+      '</ul></details>';
+  }
+  if (q.original_rows && q.migrated_rows) {
+    h += '<div class="sides">' +
+      sideTable('原库结果', q.columns, q.original_rows, q.original_count) +
+      sideTable('目标库结果', q.columns, q.migrated_rows, q.migrated_count) +
+      '</div>';
+  }
+  return h + '</div>';
+}
+
+function finishMigration(id, job) {
+  $('mig-submit-btn').disabled = false;
+  const [pill, label] = MIG_KIND_LABEL[job.kind] || ['', job.kind || ''];
+  let html = `<p>核查结论：<span class="pill ${pill}">${label}</span></p>`;
+  if (job.kind === 'migration_failed') html += migErrorBlock('迁移脚本错误', job.migration);
+  if (job.schema_error) html += `<p class="err">${esc(job.schema_error)}</p>`;
+  if (job.tables_before) {
+    html += `<p class="hint">表：原库 [${esc(job.tables_before.join(', '))}] →
+             目标库 [${esc((job.tables_after || []).join(', '))}]</p>`;
+  }
+  (job.queries || []).forEach((q, i) => { html += renderQuery(i + 1, q); });
+  if (job.download_available) {
+    html += `<a class="dl" href="/api/migration-jobs/${id}/download">下载升级库 upgraded.db</a>`;
+  } else {
+    html += '<p class="hint">未通过核查，不提供升级库；原件与已有缩减结果均未改动。</p>';
+  }
+  $('mig-job-detail').innerHTML = html;
 }
 
 loadSamples();

@@ -24,6 +24,10 @@ MAX_SCRIPT_BYTES = _int("MAX_SCRIPT_BYTES", 256 * 1024)
 MAX_TRIALS = _int("MAX_TRIALS", 800)
 TRIAL_TIMEOUT_SECONDS = _int("TRIAL_TIMEOUT_SECONDS", 15)
 
+# 迁移取数核查限制
+MAX_QUERIES = 3
+MAX_QUERY_ROWS = _int("MAX_QUERY_ROWS", 200)
+
 # 任务工作目录与保留时间
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data")).resolve()
 JOB_TTL_SECONDS = _int("JOB_TTL_SECONDS", 3600)

@@ -160,6 +160,65 @@ def confirm_baseline(canonical_path: str, script: str, work_dir: str) -> ScriptR
     return first
 
 
+def execute_migration(canonical_path: str, script: str, dest_path: str) -> ScriptResult:
+    """把规范原件复制到 dest_path，在该独立副本上完整执行迁移脚本并保留结果。
+
+    与试跑共用时限与 authorizer（禁止外部文件访问），foreign_keys 强制开启。
+    脚本必须完整成功；任何 SQLite 错误以 ScriptResult 形式返回，
+    超时抛 TrialTimeout。连接关闭后调用方才校验目标库，
+    因此校验看到的是“实际已提交”的数据。
+    """
+    shutil.copyfile(canonical_path, dest_path)
+
+    result_box: dict[str, ScriptResult] = {}
+    error_box: dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(dest_path, timeout=5.0)
+            conn.set_authorizer(_authorizer)
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                conn.executescript(script)
+                result_box["result"] = ScriptResult(ok=True)
+            except sqlite3.Error as exc:
+                result_box["result"] = ScriptResult(
+                    ok=False,
+                    error_code=exc.sqlite_errorcode,
+                    error_name=exc.sqlite_errorname,
+                    error_message=str(exc),
+                )
+        except BaseException as exc:  # noqa: BLE001 - 回传线程内任何异常
+            error_box["error"] = exc
+        finally:
+            if conn is not None:
+                conn.close()
+
+    thread = threading.Thread(target=_worker, name="sqlite-migration", daemon=True)
+    thread.start()
+    thread.join(config.TRIAL_TIMEOUT_SECONDS)
+
+    timed_out = thread.is_alive()
+    try:
+        if timed_out:
+            raise TrialTimeout(
+                f"迁移脚本执行超过 {config.TRIAL_TIMEOUT_SECONDS} 秒，已放弃。"
+            )
+        if "error" in error_box:
+            raise error_box["error"]
+        return result_box["result"]
+    finally:
+        _remove_sidecars(dest_path)
+        if timed_out:
+            # 超时的迁移结果不可用：解除文件链接，
+            # 工作线程后续写入只作用于不可达的 inode。
+            try:
+                os.unlink(dest_path)
+            except FileNotFoundError:
+                pass
+
+
 def delete_rows(canonical_path: str, work_dir: str, kept_rows: set[tuple[str, int]],
                 schema_tables: list[str], pk_column: dict[str, str],
                 out_path: str) -> None:
